@@ -1,113 +1,205 @@
-import random
 import socket
 import threading
-import pickle
-import time
 import json
-import os
+import struct
+import time
+import random
+from database import Database
+from farmer import Farmer
+from username import generate_username, announcement
+from flask import Flask, render_template
 
-# Define the server host and port
-HOST = 'localhost'
-PORT = 8888
+app = Flask(__name__)
 
-server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+farmer = Farmer([])
+clients = {}
+clients_lock = threading.Lock()
+submit_lock = True
+submission = ""
+winner = ()
+skip = False
 
-server_socket.bind((HOST, PORT))
+farmer_database = Database("farmer")
+farmer_database.create_table()
 
-server_socket.listen()
+wallet_database = Database("wallet")
+wallet_database.create_table()
 
-print(f'Server listening on port {PORT}')
+token_database = Database("token")
+token_database.create_table()
 
-work = {}
-def import_user_data(user):
-    with open(f'user_data/{user}.json', 'r') as f:
-        return json.load(f)
+def broadcast(message):
+    try:
+        global clients
+        json_data = json.dumps(message)
+        json_bytes = json_data.encode()
+        msglen = struct.pack('>I', len(json_bytes))
 
-def export_data(data, user):
-    with open(f'user_data/{user}.json', 'w') as f:
-        return json.dump(data, f)
+        with clients_lock:
+            for client in clients:
+                try:
+                    clients[client]["connection"].sendall(msglen + json_bytes)
+                except Exception as e:
+                    print(f"Error broadcasting message to a client: {e}")
+                    clients[client]["connection"].close()
+                    del clients[client]
+    except Exception:
+        pass
+    
+def send(message, sender_conn):
+    global clients
+    json_data = json.dumps(message)
+    json_bytes = json_data.encode()
+    msglen = struct.pack('>I', len(json_bytes))
 
-def pay(username, amount):
-    data = import_user_data(username)
+    try:
+        clients[sender_conn]["connection"].sendall(msglen + json_bytes)
+    except Exception as e:
+        print(f"Error broadcasting message to a client: {e}")
+        clients[sender_conn]["connection"].close()
+        del clients[sender_conn]
 
-    balance = data.get("balance")
+def check_duplicates(address):
+    global clients
+    for client in clients:
+        if clients[client]["address"] == address:
+            return False
+    return True
 
-    data["balance"] = balance + amount
-    export_data(data, username)
+def handle_client(conn, addr):
+    global clients, submit_lock, submission, winner, skip
+    print(f"New connection from {addr}")
+    with clients_lock:
 
+        ips = []
+        for client in clients:
+            ips.append(client[0])
+        if not addr[0] in ips:
+            clients[addr] = {"connection": conn, "address": ""}
+        else:
+            send({"type": "error", "message": "you already have a farmer on this IP!"}, addr)
+    
+    try:
+        while True:
+            # Read message length first (4 bytes)
+            raw_msglen = conn.recv(4)
+            if not raw_msglen:
+                break
+            msglen = struct.unpack('>I', raw_msglen)[0]
+            data = conn.recv(msglen)
+            if not data:
+                break
+            try:
+                json_data = json.loads(data.decode())
 
-def handle_client(client_socket, client_address):
-        output = ""
+                user = farmer_database.get_data(addr[0])
+                if user == None:
+                    farmer_database.insert_data(addr[0], {"username": ""})
+                    user = {"username": ""}
 
-        data = client_socket.recv(4096)
-        request = pickle.loads(data)
+                print(addr, winner)
 
-        if request.get("type") == "get_work":
+                if user["username"] == "":
+                    send({"type": "neutral", "message": f"please register your IP as a farmer in the webwallet, your IP is: {addr[0]}"}, addr)
+                else:
+                    if addr == winner:
+                        if json_data["type"] == "submit":
+                            submission = json_data["data"]
+                            submit_lock = True
 
-            if request.get("method") == "farming":
-                if os.path.isfile(f"user_data\\{request.get('address')}.json"):
-                    if not request.get('address') in list(work.keys()):
-                        generated_work = random.randint(0, 1073741824 - 32)
-                        plot_index = random.randint(0, 1000)
-
-                        work[request.get("address")] = {"work": generated_work, "submitted": False, "time": time.time(), "validators": {}, "plot_index": plot_index}
-
-                        print(work)
-                        output = {"work": generated_work, "plot_index": plot_index}
+                        elif json_data["type"] == "reject":
+                            skip = True
+                            submit_lock = True
+                        else:
+                            send({"type": "error", "message": "Invalid submission!"}, addr)
                     else:
-                        output = f"waiting for previous work to be verified ({len(work[request.get('address')].get('validators'))} / 10)"
+                        send({"type": "error", "message": "there is another IP on your account!"}, addr)
 
-            elif request.get("method") == "mining":
+            except json.JSONDecodeError as e:
+                print(f"Received invalid JSON from {addr}: {e}")
+    except Exception as e:
+        print(f"Error handling client {addr}: {e}")
+    finally:
+        print(f"Connection closed by {addr}")
+        try:
+            with clients_lock:
+                clients[addr]["connection"].close()
+                del clients[addr]
+        except KeyError:
+            pass
+def start_server():
+    global clients
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind(('10.0.0.250', 3333))
+    server.listen(5)
+    print("Server listening on port 3333")
+    
+    try:
+        while True:
+            conn, addr = server.accept()
+            thread = threading.Thread(target=handle_client, args=(conn, addr))
+            thread.start()
+    except Exception as e:
+        print(f"Error accepting connections: {e}")
+    finally:
+        server.close()
 
-                key = list(work.keys())[random.randint(0, len(work) - 1)]
-                work[key]["validators"][request.get("address")] = ""
+def loop():
+    global submit_lock, clients, submission, winner, skip
+    while True:
+        try:
+            print("getting next client...")
+            while True:
+                try:
+                    winner = random.choice(list(clients.keys()))
+                    try:
+                        address = farmer_database.get_data(winner[0].replace("\n", ""))["username"]
+                        if not address == "" or address == None:
+                            break
+                    except TypeError:
+                        send({"type": "error", "message": f"you must verify your IP in the webwallet! Your IP: {winner[0]}", "break": True}, winner)
+                except IndexError:
+                    pass
 
-                output = {"public_key": key, "work": work[key]}
+            print(f"client {address} chosen")
+            submit_lock = False
 
-        elif request.get("type") == "submit_work":
+            seed = random.randint(0, 12)
+            index = random.randint(0, 469762016)
 
-            if request.get("method") == "farming":
-                work[request.get("address")]["submitted"] = True
+            broadcast({"type": "proof", "address": address, "index": index, "seed": seed, "message": announcement(address)})
 
-                if (time.time() - work[request.get("address")]["time"]) > 3:
-                    output = "your submission speed is too low"
-                else:
-                    work[request.get("address")]["submission"] = request.get("submission")
+            print("awaiting response...")
 
-                    print(request)
+            t = time.time()
+            while time.time() - t < 2:
+                if submit_lock:
+                    if skip:
+                        broadcast({"type": "skipped", "message": f"farmer {address} skipped."})
+                        skip = False
+                        break
+                    else:
+                        print("client responded!")
+                        broadcast({"type": "suspense", "message": f"farmer {address} responded. Drum-roll please!"})
+                        farmer.plot({"address": address, "seed": seed}, "E:\\temp.tiny")
+                        print(farmer.extract("E:\\temp.tiny", index), submission)
+                        if farmer.extract("E:\\temp.tiny", index)[0] == submission[0]:
+                            reward = (len(clients) / 100) * (25 - seed)
+                            broadcast({"type": "winner", "message": f"farmer {address} WON THE BLOCK!!! (+{reward} TiD)"})
+                        else:
+                            broadcast({"type": "error", "message": f"farmer {address} responded with the wrong data"})
+                        break
+            if submit_lock == False:
+                print("client did not respond")
+                broadcast({"type": "error", "message": f"farmer {address} did not respond"})
+                submit_lock = True
+        except Exception as e:
+            print(f"server error occured, round restarting: {e}")
+            broadcast({"type": "error", "message": f"server error occured, round restarting."})
 
-                    output = "your submission is being verified!"
+if __name__ == "__main__":
+    concurrent_thread = threading.Thread(target=loop)
+    concurrent_thread.daemon = True
+    concurrent_thread.start()
 
-            elif request.get("method") == "mining":
-
-                print(list(work[request.get("public_key")]["validators"].keys()))
-
-                if str(request.get("address")) in list(work[request.get("public_key")]["validators"].keys()):
-                    work[request.get("public_key")]["validators"][request.get("address")] = request.get("submission")
-                    output = work
-                else:
-                    output = f"{request.get('address')}, you are not registered to validate this submission"
-
-                if len(work[request.get("public_key")]["validators"]) >= 10:
-                    consensus = max(set(list(work[request.get("public_key")]["validators"].values())), key = list(work[request.get("public_key")]["validators"].values()).count)
-
-                    if work[request.get("public_key")]["submission"] == consensus:
-                        pay(request.get("public_key"), 0.001)
-
-                    output = {"you have been paid 0.001 for your part of consensus!"}
-
-                    work.pop(request.get("public_key"))
-
-        client_socket.send(pickle.dumps(output))
-
-        client_socket.close()
-
-while True:
-    # Accept incoming connections
-    client_socket, client_address = server_socket.accept()
-
-    print(f'Accepted connection from {client_address}')
-
-    # Start a new thread to handle the client request
-    client_thread = threading.Thread(target=handle_client, args=(client_socket, client_address))
-    client_thread.start()
+    start_server()
