@@ -2,9 +2,11 @@ import os
 import random
 import json
 import time
-from Crypto.Hash import SHAKE128
+import hashlib
 from tqdm import tqdm
 from colorama import Fore
+from Crypto.Hash import SHAKE128
+import configparser
 
 import socket
 import json
@@ -18,7 +20,8 @@ running = True
 submit = False
 index = 0
 
-address = "jerrbearis2cool"
+address = ""
+directories = []
 
 class Print:
     def success(header, message):
@@ -86,12 +89,10 @@ def receive_messages(client):
     global running, submit, index, plots
     while running:
         try:
-            # Read message length first (4 bytes)
             raw_msglen = client.recv(4)
             if not raw_msglen:
                 break
             msglen = struct.unpack('>I', raw_msglen)[0]
-            # Read the actual message data
             data = client.recv(msglen)
             if not data:
                 break
@@ -163,23 +164,47 @@ def start_client():
 
     return client, receive_thread, send_thread
 
-directories = ["E:\\", os.path.dirname(os.path.realpath(__file__))]
-
 class Plots:
     def __init__(self, paths):
         self.plots = []
         for path in paths:
-            files = os.listdir(path)
+            if path == "":
+                files = os.listdir(os.path.dirname(os.path.realpath(__file__)))
+            else:
+                files = os.listdir(path)
             for file in files:
                 if file.endswith('.tiny'):
                     self.plots.append({"name": file, "path": os.path.join(path, file), "seed": file.replace(".tiny", "").replace("plot_", "")})
 
     def list_plots(self):
+        seeds = []
+        for plot in self.plots:
+            if plot["seed"] in seeds:
+                printf.error("Uh Oh!", "you have duplicate plots, please ensure that all plot seeds are different!")
+            if not int(plot["seed"]) >= 0 and int(plot["seed"]) <= 24:
+                printf.error("Uh Oh!", "you have invalid plots!")
         return self.plots
 print("retrieving plots...")
 
 plots = Plots(directories)
-print(plots.list_plots())
+def update():
+    global address, directories, plots
+
+    with open('config.json', 'r') as f:
+        user_data = json.load(f)
+
+    address = user_data["username"]
+    directories = user_data["directories"]
+    plots = Plots(directories)
+
+update()
+plots.list_plots()
+
+if address == "":
+    username = input("enter your username:")
+    with open('config.json', 'w') as f:
+        json.dump({"username": username, "directories": directories}, f)
+
 
 if __name__ == "__main__":
     print(Fore.CYAN + """
@@ -197,10 +222,13 @@ if __name__ == "__main__":
         command = input()
         print()
         if command == "farm":
-            signal.signal(signal.SIGINT, signal_handler)
-            client, receive_thread, send_thread = start_client()
-            print("you have started farming...")
-            break
+            if len(plots.list_plots()) <= 0:
+                printf.error("Uh Oh!", "you have no plots detected, please plot some files before farming!")
+            else:
+                signal.signal(signal.SIGINT, signal_handler)
+                client, receive_thread, send_thread = start_client()
+                print("you have started farming...")
+                break
         elif command == "plot":
             dir = input("Enter a directory (eg. D:\\), leave empty for the directory this app is in:\n")
             while True:
@@ -210,4 +238,8 @@ if __name__ == "__main__":
                 else:
                     print(printf.error("Seed must be between or equal to 0 - 12", ""))
             farmer.plot({"address": address, "seed": seed}, f"{dir}{seed}.tiny")
-            
+
+            directories.append(dir)
+            with open('config.json', 'w') as f:
+                json.dump({"username": address, "directories": directories}, f)
+            update()            
